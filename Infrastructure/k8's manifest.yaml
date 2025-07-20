@@ -1,0 +1,122 @@
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rails-app
+
+---
+
+# Service Account with IRSA
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rails-app-sa
+  namespace: rails-app
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/eks-s3-access-role
+
+---
+
+# Secret (from secret manager)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secret
+  namespace: rails-app
+type: Opaque
+stringData:
+  RDS_PASSWORD: "USE_EXTERNAL_AWS_SECRETS_MANAGER"
+
+---
+
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rails-app
+  namespace: rails-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rails-app
+  template:
+    metadata:
+      labels:
+        app: rails-app
+    spec:
+      serviceAccountName: rails-app-sa
+      containers:
+        - name: rails
+          image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/devops-interview-ecr-app:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: RDS_DB_NAME
+              value: "ror_production"
+            - name: RDS_USERNAME
+              value: "roruser"
+            - name: RDS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: RDS_PASSWORD
+            - name: RDS_HOSTNAME
+              value: "<your-db-endpoint>"
+            - name: RDS_PORT
+              value: "5432"
+            - name: S3_BUCKET_NAME
+              value: "<your-s3-bucket-name>"
+            - name: S3_REGION_NAME
+              value: "ap-south-1"
+            - name: LB_ENDPOINT
+              value: "prod-app-alb-1234567890.ap-south-1.elb.amazonaws.com"
+        - name: rails_app
+          image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/devops-interview-ecr-nginx:latest
+          ports:
+            - containerPort: 80
+
+---
+
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: rails-app-service
+  namespace: rails-app
+  labels:
+    app: rails-app
+spec:
+  selector:
+    app: rails-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: NodePort
+
+---
+
+# Ingress with AWS ALB
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rails-app-ingress
+  namespace: rails-app
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/load-balancer-name: prod-app-alb
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rails-app-service
+                port:
+                  number: 80

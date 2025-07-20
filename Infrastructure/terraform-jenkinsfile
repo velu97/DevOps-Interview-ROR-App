@@ -1,0 +1,67 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION     = 'ap-south-1'
+    ENVIRONMENT    = 'prod'
+    TF_VAR_region  = "${AWS_REGION}"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        git branch: 'main', credentialsId: 'terra-cred', url: 'https://github.com/velu/terraform.git'
+      }
+    }
+
+    stage('Setup AWS Credentials') {
+      steps {
+        withCredentials([[
+          $class: 'AmazonWebServicesCredentialsBinding',
+          credentialsId: 'aws-cred-id',
+          accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+          secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+        ]]) {
+          echo 'AWS credentials configured.'
+        }
+      }
+    }
+
+    stage('Terraform Init') {
+      steps {
+        sh 'terraform init'
+      }
+    }
+
+    stage('Terraform Validate') {
+      steps {
+        sh 'terraform validate'
+      }
+    }
+
+    stage('Terraform Plan') {
+      steps {
+        sh 'terraform plan -out=tfplan'
+      }
+    }
+
+    stage('Terraform Apply') {
+      steps {
+        input message: "Apply Terraform plan?"
+        sh 'terraform apply -auto-approve tfplan'
+      }
+    }
+  }
+
+  post {
+    success {
+      echo 'Terraform deployment completed successfully.'
+    }
+    failure {
+      echo 'Terraform deployment failed.'
+    }
+    always {
+      cleanWs()
+    }
+  }
+}

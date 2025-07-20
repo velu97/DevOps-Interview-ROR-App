@@ -1,0 +1,140 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION     = 'ap-south-1'
+    ECR_REPO       = 'devops-interview-ecr'
+    CLUSTER_NAME   = 'devops-interview-eks'
+    EKS_NAMESPACE  = 'rails-app'
+    IMAGE_TAG      = "${env.BUILD_NUMBER}"
+    AWS_ACCOUNT_ID = credentials('aws-account-id')
+    AWS_ACCESS_KEY_ID = credentials('aws-access-key-id')
+    AWS_SECRET_ACCESS_KEY = credentials('aws-secret-access-key')
+    SONARQUBE_ENV  = 'SonarQube'
+  }
+
+  tools {
+    maven 'Maven 3.8.1'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        git branch: 'main', credentialsId: 'git-cred', url: 'https://github.com/velu97/terraform.git'
+      }
+    }
+
+    stage('Maven Build') {
+      when {
+        expression { fileExists('pom.xml') }
+      }
+      steps {
+        sh 'mvn clean install'
+      }
+    }
+
+    stage('SonarQube Analysis') {
+      steps {
+        withSonarQubeEnv("${SONARQUBE_ENV}") {
+          sh 'sonar-scanner'
+        }
+      }
+    }
+
+    stage('OWASP Dependency Check') {
+      steps {
+        sh '''
+          if [ ! -f dependency-check/bin/dependency-check.sh ]; then
+            curl -L -o dc.zip https://github.com/jeremylong/DependencyCheck/releases/download/v8.4.0/dependency-check-8.4.0-release.zip
+            unzip -q dc.zip -d dependency-check
+            chmod +x dependency-check/bin/dependency-check.sh
+          fi
+
+          dependency-check/bin/dependency-check.sh \
+            --project "DevOps-ROR-App" \
+            --format "HTML" \
+            --scan . \
+            --out dependency-check-report
+        '''
+        publishHTML([
+          allowMissing: false,
+          alwaysLinkToLastBuild: true,
+          keepAll: true,
+          reportDir: 'dependency-check-report',
+          reportFiles: 'dependency-check-report.html',
+          reportName: 'OWASP Dependency Check'
+        ])
+      }
+    }
+
+    stage('Build & Push Docker Images') {
+      steps {
+        script {
+          def appImage = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}-app:${IMAGE_TAG}"
+          def nginxImage = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}-nginx:${IMAGE_TAG}"
+
+          // ECR login
+          sh """
+            aws ecr get-login-password --region $AWS_REGION | \
+            docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.$AWS_REGION.amazonaws.com
+          """
+
+          // Build images
+          sh "docker build -t ${appImage} docker/app"
+          sh "docker build -t ${nginxImage} docker/nginx"
+
+          // Push images
+          sh "docker push ${appImage}"
+          sh "docker push ${nginxImage}"
+        }
+      }
+    }
+
+    stage('Trivy Image Scan') {
+      steps {
+        script {
+          def appImage = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}-app:${IMAGE_TAG}"
+          def nginxImage = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}-nginx:${IMAGE_TAG}"
+
+          sh "trivy image --severity HIGH,CRITICAL ${appImage} || true"
+          sh "trivy image --severity HIGH,CRITICAL ${nginxImage} || true"
+        }
+      }
+    }
+
+    stage('Deploy to EKS') {
+      steps {
+        script {
+          def appImage = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}-app:${IMAGE_TAG}"
+          def nginxImage = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}-nginx:${IMAGE_TAG}"
+
+          sh """
+            aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+
+            # Replace image placeholders in deployment
+            sed -i 's|<APP_IMAGE>|${appImage}|g' infracture/deployment.yaml
+            sed -i 's|<NGINX_IMAGE>|${nginxImage}|g' infracture/deployment.yaml
+
+            kubectl apply -n $EKS_NAMESPACE -f infracture/namespace.yaml
+            kubectl apply -n $EKS_NAMESPACE -f infracture/serviceaccount.yaml
+            kubectl apply -n $EKS_NAMESPACE -f infracture/deployment.yaml
+            kubectl apply -n $EKS_NAMESPACE -f infracture/service.yaml
+            kubectl apply -n $EKS_NAMESPACE -f infracture/ingress.yaml
+          """
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      cleanWs()
+    }
+    success {
+      echo ' Deployment completed successfully.'
+    }
+    failure {
+      echo ' Deployment failed!'
+    }
+  }
+}
